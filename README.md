@@ -1,9 +1,4 @@
 # LangChain & LangGraph Interview Questions for AI/ML Roles
-
-> **Syntax Note:** All LangChain examples use **modern LCEL (LangChain Expression Language)** syntax.  
-> Deprecated classes like `LLMChain`, `SequentialChain`, `initialize_agent`, and `from langchain.llms import OpenAI` have been replaced with their current equivalents.  
-> Key import changes: `langchain_openai`, `langchain_core`, `langchain_community` packages are now separate installs.
-
 ---
 
 ## Table of Contents
