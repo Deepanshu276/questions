@@ -1,4 +1,9 @@
 # LangChain & LangGraph Interview Questions for AI/ML Roles
+
+> **Syntax Note:** All LangChain examples use **modern LCEL (LangChain Expression Language)** syntax.  
+> Deprecated classes like `LLMChain`, `SequentialChain`, `initialize_agent`, and `from langchain.llms import OpenAI` have been replaced with their current equivalents.  
+> Key import changes: `langchain_openai`, `langchain_core`, `langchain_community` packages are now separate installs.
+
 ---
 
 ## Table of Contents
@@ -5992,3 +5997,2206 @@ def test_full_agent():
 ---
 
 *Last updated: June 2026 | LangChain ≥1.0 | LangGraph ≥0.4*
+
+
+---
+
+# Part 3: Production RAG Interview Questions (40 Questions)
+
+> 40 deep-dive questions on production-grade Retrieval-Augmented Generation. Answers follow **industry standards** used at companies like Databricks, Confluent, Stripe, Morgan Stanley, and Bloomberg. Every answer includes architecture decisions, failure modes, and real code.
+
+---
+
+## Table of Contents (RAG)
+- [RAG Fundamentals](#rag-fundamentals)
+- [Hallucination — Causes, Reality, and Mitigation](#hallucination--causes-reality-and-mitigation)
+- [Large-Scale RAG — 1M Documents / 100GB+](#large-scale-rag--1m-documents--100gb)
+- [Structured & Tabular RAG — FinTech Accuracy](#structured--tabular-rag--fintech-accuracy)
+- [Production Architecture & MLOps for RAG](#production-architecture--mlops-for-rag)
+- [Retrieval Quality & Evaluation](#retrieval-quality--evaluation)
+- [Advanced Retrieval Patterns](#advanced-retrieval-patterns)
+- [RAG Security & Compliance](#rag-security--compliance)
+
+---
+
+## RAG Fundamentals
+
+---
+
+**RAG-1. What is Retrieval-Augmented Generation (RAG) and why do production systems use it instead of fine-tuning?**
+
+RAG grounds LLM responses in external, up-to-date knowledge by retrieving relevant documents at inference time and injecting them into the prompt. Fine-tuning bakes knowledge into weights — it is expensive to update, requires retraining for every data change, and does not inherently cite sources.
+
+> **Interview tip:** The key production argument is **freshness + auditability**. RAG lets you update the knowledge base without touching the model. At Morgan Stanley, the wealth management assistant uses RAG over 100,000+ research documents so advisors can cite the source of every claim.
+
+```python
+# Canonical production RAG pipeline (LangChain LCEL)
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import PGVector
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+
+embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+vectorstore = PGVector.from_existing_index(
+    embedding=embeddings,
+    collection_name="prod_docs",
+    connection_string="postgresql+psycopg2://..."
+)
+retriever = vectorstore.as_retriever(
+    search_type="mmr",            # Maximal Marginal Relevance — reduces redundancy
+    search_kwargs={"k": 6, "fetch_k": 20, "lambda_mult": 0.7}
+)
+
+SYSTEM = """You are a factual assistant. Answer ONLY using the provided context.
+If the context does not contain enough information to answer, say "I don't have enough information."
+Never use prior knowledge outside the context.
+
+Context:
+{context}"""
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM),
+    ("human", "{question}")
+])
+
+def format_docs(docs):
+    return "\n\n---\n\n".join(
+        f"[Source: {d.metadata.get('source','unknown')} | Page: {d.metadata.get('page','')}]\n{d.page_content}"
+        for d in docs
+    )
+
+chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | prompt
+    | ChatOpenAI(model="gpt-4o", temperature=0)  # temperature=0 for factual tasks
+    | StrOutputParser()
+)
+```
+
+---
+
+**RAG-2. What are the five stages of a production RAG pipeline and what can go wrong at each stage?**
+
+A production RAG pipeline has five stages. Each has distinct failure modes that production teams must monitor.
+
+> **Interview tip:** Interviewers at senior levels want you to walk through each stage and name the metric you'd watch. This answer maps directly to what teams at Databricks and Confluent use in production runbooks.
+
+```
+Stage 1: INGESTION
+  What happens: Documents are loaded, cleaned, chunked, embedded, and stored.
+  Failure mode: Bad chunking destroys semantic coherence. A 2,000-token chunk that
+  straddles two topics means both topics retrieve irrelevant context.
+  Metric to watch: Chunk overlap ratio, embedding latency P99.
+
+Stage 2: INDEXING
+  What happens: Embeddings are stored in a vector DB with metadata.
+  Failure mode: Stale index — new documents are not re-indexed. Users get outdated answers.
+  Metric to watch: Index lag (time between document publish and index availability).
+
+Stage 3: RETRIEVAL
+  What happens: Query is embedded, ANN search returns top-k chunks.
+  Failure mode: Semantic mismatch — the query embedding and document embedding use
+  different models or vocabularies (e.g., internal jargon not in training data).
+  Metric to watch: Recall@k (did ground-truth chunks appear in top-k?).
+
+Stage 4: AUGMENTATION (PROMPT CONSTRUCTION)
+  What happens: Retrieved chunks are injected into the LLM prompt.
+  Failure mode: Context window overflow; irrelevant chunks dilute the signal
+  ("lost in the middle" problem — LLMs underweight information in the middle).
+  Metric to watch: Context utilization rate, answer faithfulness score.
+
+Stage 5: GENERATION
+  What happens: LLM generates a response conditioned on retrieved context.
+  Failure mode: Hallucination when the context is insufficient. LLM "fills in"
+  from parametric memory instead of saying "I don't know."
+  Metric to watch: Faithfulness (RAGAS), answer relevancy, citation accuracy.
+```
+
+```python
+# Production monitoring hook — attach to each stage
+import time, logging
+from langchain_core.callbacks import BaseCallbackHandler
+
+class RAGStageMonitor(BaseCallbackHandler):
+    def on_retriever_start(self, query, **kwargs):
+        self._t = time.perf_counter()
+        logging.info(f"[RETRIEVAL START] query={query[:80]}")
+
+    def on_retriever_end(self, documents, **kwargs):
+        latency_ms = (time.perf_counter() - self._t) * 1000
+        logging.info(f"[RETRIEVAL END] docs_returned={len(documents)} latency={latency_ms:.1f}ms")
+        # Emit to Datadog / Prometheus:
+        # metrics.histogram("rag.retrieval.latency_ms", latency_ms)
+        # metrics.gauge("rag.retrieval.docs_count", len(documents))
+```
+
+---
+
+**RAG-3. How do you design a production-grade RAG system from scratch? Walk through the full architecture.**
+
+A production RAG system has an offline pipeline (ingestion) and an online pipeline (serving). They must be independently scalable and observable.
+
+> **Interview tip:** Draw this architecture in system design interviews. The key insight is that ingestion and serving are separate concerns. Name specific tools at each layer.
+
+```
+OFFLINE INGESTION PIPELINE:
+  [Document Sources: S3 / GCS / SharePoint / Confluence / Databases]
+       │
+  [Document Loader: Unstructured.io / LangChain loaders → PDF, DOCX, HTML, CSV]
+       │
+  [Pre-processing: PII scrubbing (Presidio), language detection, table extraction]
+       │
+  [Chunking: Semantic chunking (preferred) / Recursive character splitter (fallback)]
+       │
+  [Embedding Model: text-embedding-3-large (OpenAI) / E5-large / BGE-M3 (self-hosted)]
+       │
+  [Vector Store + Keyword Index + Metadata Store]
+   PGVector/Pinecone   Elasticsearch/BM25   PostgreSQL
+
+ONLINE SERVING PIPELINE:
+  [User Query]
+       │
+  [Query Processing: Query rewriting / HyDE / Query classification]
+       │
+  [Hybrid Retriever: Dense (vector) + Sparse (BM25) → Reciprocal Rank Fusion]
+       │
+  [Reranker: Cross-encoder (Cohere Rerank / BGE)]
+       │
+  [Context Assembly: Dedup, truncate, cite sources]
+       │
+  [LLM Generation: GPT-4o / Claude at temperature=0 with structured output]
+       │
+  [Response Validation: Faithfulness check → Guardrails]
+       │
+  [Response + Citations → User]
+```
+
+---
+
+**RAG-4. What chunking strategies exist and which should you use in production?**
+
+Chunking is one of the highest-impact decisions in RAG. The wrong strategy degrades retrieval quality more than almost any other factor.
+
+> **Interview tip:** Most candidates say "fixed-size chunks with overlap." Senior engineers know the five strategies and can articulate when each applies. Semantic chunking and proposition-level chunking are the production standards at leading AI companies.
+
+```python
+# Strategy 1: Fixed-size (baseline — avoid in production for prose)
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=64)
+
+# Strategy 2: Semantic chunking (PREFERRED for prose documents)
+# Groups sentences by embedding similarity — keeps semantic units together
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_openai import OpenAIEmbeddings
+splitter = SemanticChunker(
+    OpenAIEmbeddings(),
+    breakpoint_threshold_type="percentile",
+    breakpoint_threshold_amount=85
+)
+
+# Strategy 3: Proposition-level chunking (BEST retrieval quality, highest cost)
+# Each chunk = one atomic fact. Ask an LLM to decompose documents into propositions.
+PROP_PROMPT = """Decompose the following text into atomic propositions.
+Each proposition should be a single, self-contained factual statement.
+Return as a JSON list of strings.
+Text: {text}"""
+# Then embed each proposition separately — dense, high-precision retrieval.
+
+# Strategy 4: Parent-child chunking (production standard for long docs)
+from langchain.retrievers import ParentDocumentRetriever
+from langchain.storage import InMemoryStore
+from langchain_community.vectorstores import Chroma
+
+child_splitter = RecursiveCharacterTextSplitter(chunk_size=200)
+parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000)
+store = InMemoryStore()  # use Redis in production
+vectorstore = Chroma(embedding_function=OpenAIEmbeddings())
+
+retriever = ParentDocumentRetriever(
+    vectorstore=vectorstore,
+    docstore=store,
+    child_splitter=child_splitter,
+    parent_splitter=parent_splitter,
+)
+# Small chunks for precision retrieval, large parent chunks returned for full context
+
+# Strategy 5: Document-structure-aware chunking (PDFs/markdown with headers)
+from langchain_text_splitters import MarkdownHeaderTextSplitter
+headers_to_split_on = [("#", "h1"), ("##", "h2"), ("###", "h3")]
+splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+# Each chunk retains header metadata → better filtering and context
+```
+
+---
+
+**RAG-5. What embedding models should you use in production and how do you choose?**
+
+Embedding model choice affects retrieval quality, cost, latency, and data privacy. There is no universally best model — the right choice depends on your domain, data privacy requirements, and scale.
+
+> **Interview tip:** Cite the MTEB (Massive Text Embedding Benchmark) leaderboard. For domain-specific data (legal, medical, financial), fine-tuning an open-source model often beats generic models.
+
+```python
+# Option 1: OpenAI (best general quality, requires API)
+from langchain_openai import OpenAIEmbeddings
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-large",  # 3072 dims, best quality
+    # model="text-embedding-3-small"  # 1536 dims, 5x cheaper, ~95% of quality
+)
+
+# Option 2: Self-hosted (data privacy, fixed cost at scale)
+from langchain_community.embeddings import HuggingFaceEmbeddings
+embeddings = HuggingFaceEmbeddings(
+    model_name="BAAI/bge-large-en-v1.5",
+    model_kwargs={"device": "cuda"},
+    encode_kwargs={"normalize_embeddings": True, "batch_size": 128}
+)
+
+# Option 3: Cohere (strong multilingual support)
+from langchain_cohere import CohereEmbeddings
+embeddings = CohereEmbeddings(model="embed-english-v3.0")
+
+# Production decision matrix:
+# General SaaS          → text-embedding-3-large   (best MTEB, API cost tradeoff)
+# Financial/legal data  → Fine-tuned BGE            (domain fit, self-hosted)
+# GDPR / on-prem        → BGE / E5 local            (no data egress, GPU needed)
+# Multilingual          → multilingual-e5-large     (100+ languages)
+# High scale, cost-opt  → text-embedding-3-small    (5x cheaper, ~95% quality)
+```
+
+---
+
+## Hallucination — Causes, Reality, and Mitigation
+
+---
+
+**RAG-6. Can RAG achieve zero hallucination? If not, why not — and what are the exact production steps to minimize it?**
+
+No. Zero hallucination is not achievable in any production RAG system with a generative LLM. Understanding why — and the precise mitigation layers — is critical for senior roles.
+
+> **Interview tip:** This is a trap question for junior candidates who say "yes, RAG prevents hallucination." The correct answer names three root causes and at least five concrete mitigations. Companies like Glean, Perplexity, and Vectara have published their multi-layer approaches.
+
+**Why zero hallucination is impossible:**
+
+```
+Root Cause 1: RETRIEVAL FAILURE
+  The most relevant document is not in the index, or the query fails to retrieve it.
+  The LLM, having no grounding context, falls back on parametric memory.
+  Example: User asks about a policy updated yesterday; the index hasn't re-ingested it.
+
+Root Cause 2: CONTEXT INSUFFICIENT / AMBIGUOUS
+  Retrieved chunks exist but don't fully answer the question.
+  The LLM "helpfully" extrapolates beyond what the context supports.
+  Example: Context says "Revenue was $2.1B in Q3." User asks "Was Q3 better than Q2?"
+  LLM may infer yes/no without Q2 data being retrieved.
+
+Root Cause 3: LLM PARAMETRIC MEMORY BLEED
+  Even with perfect context, LLMs blend retrieved facts with training-time knowledge.
+  Particularly dangerous for numbers, dates, and proper nouns.
+  Example: Context says CEO is Alice. LLM "knows" from training it was Bob → blends both.
+
+Root Cause 4: PROMPT INJECTION / CONTEXT POISONING
+  Malicious content in the document corpus instructs the LLM to ignore retrieved context.
+```
+
+**Production mitigation — the 7-layer approach:**
+
+```python
+# LAYER 1: HYBRID SEARCH — catch what pure vector search misses
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
+
+bm25 = BM25Retriever.from_documents(docs, k=10)
+dense = vectorstore.as_retriever(search_kwargs={"k": 10})
+hybrid = EnsembleRetriever(retrievers=[bm25, dense], weights=[0.3, 0.7])
+
+# LAYER 2: RERANKING — score relevance with cross-encoder, not just cosine similarity
+from langchain_cohere import CohereRerank
+from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
+
+reranker = CohereRerank(model="rerank-english-v3.0", top_n=4)
+retriever = ContextualCompressionRetriever(base_compressor=reranker, base_retriever=hybrid)
+
+# LAYER 3: CONFIDENCE GATE — refuse to answer if context isn't relevant enough
+def retrieve_with_confidence_gate(query: str, threshold: float = 0.75):
+    docs_and_scores = vectorstore.similarity_search_with_score(query, k=6)
+    top_score = docs_and_scores[0][1] if docs_and_scores else 0.0
+    if top_score < threshold:
+        return None, "I don't have reliable information to answer this question."
+    return [d for d, _ in docs_and_scores], None
+
+# LAYER 4: STRICT SYSTEM PROMPT — constrain LLM to context only
+ANTI_HALLUCINATION_SYSTEM = """You are a precise factual assistant.
+
+STRICT RULES:
+1. Answer ONLY using information explicitly stated in the provided context.
+2. If the context does not contain enough information, say exactly:
+   "The provided documents do not contain enough information to answer this question."
+3. Do NOT use any knowledge from your training data.
+4. Do NOT make inferences, extrapolations, or educated guesses.
+5. Always cite the source document for each factual claim.
+6. Numbers, dates, names in your answer MUST appear verbatim in the context.
+
+Context:
+{context}"""
+
+# LAYER 5: STRUCTURED OUTPUT WITH CITATIONS
+from pydantic import BaseModel, Field
+from typing import List
+
+class Citation(BaseModel):
+    source_id: str = Field(description="The source document ID or filename")
+    quote: str = Field(description="The exact quote from the source supporting this claim")
+
+class GroundedAnswer(BaseModel):
+    answer: str
+    citations: List[Citation]
+    confidence: str = Field(description="high / medium / low")
+    unanswered_aspects: List[str] = Field(default_factory=list)
+
+structured_llm = ChatOpenAI(model="gpt-4o", temperature=0).with_structured_output(GroundedAnswer)
+
+# LAYER 6: FAITHFULNESS CHECK (LLM-as-judge)
+FAITHFULNESS_PROMPT = """You are a faithfulness judge. Identify any claims in the answer
+NOT supported by the context.
+
+Context: {context}
+Answer: {answer}
+
+Return JSON: {{"faithful": true/false, "unsupported_claims": ["claim1", ...]}}"""
+
+async def check_faithfulness(context: str, answer: str, llm) -> dict:
+    result = await llm.ainvoke(FAITHFULNESS_PROMPT.format(context=context, answer=answer))
+    import json
+    return json.loads(result.content)
+
+# LAYER 7: MONITORING — track hallucination rate over time with RAGAS
+# Run nightly faithfulness evaluation batch. Alert if score drops below 0.85.
+# Log every (query, context, answer) tuple for audit and debugging.
+
+# The honest answer: with all 7 layers, production systems achieve 95-99% faithfulness.
+# Zero is not the target — a measurable, monitored, continuously improving rate is.
+```
+
+---
+
+**RAG-7. What is the "lost in the middle" problem and how do you fix it?**
+
+LLMs pay disproportionately more attention to content at the beginning and end of the context window than to content in the middle. When you stuff 20 retrieved chunks into a prompt, the most relevant chunk may be in the middle — and the LLM effectively ignores it.
+
+> **Interview tip:** This was formally studied in the paper "Lost in the Middle" (Liu et al., 2023). The fix is reranking + context reordering, not just retrieving more chunks.
+
+```python
+from langchain_community.document_transformers import LongContextReorder
+
+reorder = LongContextReorder()
+
+def build_context_with_reorder(docs):
+    # After reranking, reorder so top docs are at position 0 and -1 (start and end)
+    reordered = reorder.transform_documents(docs)
+    return "\n\n".join(d.page_content for d in reordered)
+
+# Fix 2: Limit context to fewer, higher-quality chunks (k=4, not k=20)
+# More context ≠ better answers. After reranking, pass only top 4 chunks.
+
+# Fix 3: Use models with better long-context attention
+# GPT-4o and Claude 3.5 handle this better than GPT-3.5 or older models.
+
+# Fix 4: Map-reduce for very long document sets — process each chunk independently,
+# then synthesize — avoids the problem entirely.
+```
+
+---
+
+**RAG-8. What is HyDE (Hypothetical Document Embedding) and when should you use it?**
+
+HyDE generates a hypothetical answer to the query, embeds that answer, and uses it as the retrieval query instead of the original question. It bridges the gap between question embeddings and answer embeddings, which often live in different parts of the embedding space.
+
+> **Interview tip:** HyDE is particularly effective for technical or domain-specific queries where user vocabulary differs from document vocabulary (e.g., plain English query vs legal/medical/financial jargon). Tradeoff: adds one LLM call per retrieval.
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_core.output_parsers import StrOutputParser
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+
+hyde_prompt = ChatPromptTemplate.from_template(
+    "Write a short passage (3-5 sentences) that would answer the following question. "
+    "Write it as if it were from a technical document.\n\nQuestion: {question}"
+)
+generate_hypothesis = hyde_prompt | llm | StrOutputParser()
+
+def hyde_retrieve(query: str, vectorstore, k: int = 6):
+    hypothesis = generate_hypothesis.invoke({"question": query})
+    hypothesis_embedding = embeddings.embed_query(hypothesis)
+    docs = vectorstore.similarity_search_by_vector(hypothesis_embedding, k=k)
+    return docs
+
+# When to use HyDE:
+# ✅ Domain-specific documents (legal, medical, financial)
+# ✅ Queries in plain language, documents in technical language
+# ✅ When recall@k is low with direct query embedding
+# ❌ Real-time / low-latency requirements (adds ~200-500ms)
+# ❌ When query vocabulary already matches document vocabulary
+```
+
+---
+
+**RAG-9. What is query rewriting and how does it improve RAG accuracy?**
+
+A user's raw query is often ambiguous, uses pronouns referring to prior conversation, or is phrased in a way that doesn't match document vocabulary. Query rewriting transforms the query before retrieval to maximize recall.
+
+> **Interview tip:** Three production patterns — standalone question generation (multi-turn), multi-query expansion (ambiguous queries), and step-back prompting (abstract questions). Name all three.
+
+```python
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+# Pattern 1: Standalone question (multi-turn conversations)
+STANDALONE_PROMPT = ChatPromptTemplate.from_template(
+    """Given conversation history and a follow-up question, rewrite as a standalone
+    question containing all necessary context.
+    
+    History: {chat_history}
+    Follow-up: {question}
+    Standalone question:"""
+)
+standalone_chain = STANDALONE_PROMPT | llm | StrOutputParser()
+
+# Pattern 2: Multi-query expansion
+# Generates 3-5 different phrasings — union of results dramatically improves recall
+multi_query_retriever = MultiQueryRetriever.from_llm(
+    retriever=vectorstore.as_retriever(search_kwargs={"k": 4}),
+    llm=llm,
+    include_original=True
+)
+
+# Pattern 3: Step-back prompting (for abstract / high-level questions)
+STEPBACK_PROMPT = ChatPromptTemplate.from_template(
+    """Generate a more general "step-back" question that retrieves broader context
+    needed to answer the specific question.
+    
+    Specific question: {question}
+    Step-back question:"""
+)
+# Example:
+# Specific: "What was Apple's iPhone 15 revenue in Q4 2023?"
+# Step-back: "What were Apple's iPhone revenue trends in 2023?"
+# Retrieves broader context that contains the specific answer
+```
+
+---
+
+## Large-Scale RAG — 1M Documents / 100GB+
+
+---
+
+**RAG-10. How do you build a RAG system over 1 million documents or 100GB of data?**
+
+At scale, three things break in naive RAG: ingestion speed, index size and query latency, and cost. Each requires a specific architectural response.
+
+> **Interview tip:** This is a senior/staff-level question. The answer has three dimensions: offline ingestion at scale, vector DB selection and sharding, and query-time optimizations. Name specific tools — Ray for parallelism, Pinecone/Weaviate for hosting, HNSW vs IVF-PQ for indexing.
+
+```python
+# CHALLENGE 1: INGESTION — processing 100GB in reasonable time
+# 1M docs × 100ms/doc = ~28 hours single-threaded
+# 1M docs × 16 Ray workers = ~1.75 hours
+
+import ray
+
+@ray.remote
+def process_document_batch(doc_paths: list, embedding_model: str) -> list:
+    """Process a batch of documents: load → chunk → embed → return vectors"""
+    from langchain_openai import OpenAIEmbeddings
+    from langchain_community.document_loaders import UnstructuredFileLoader
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    
+    embedder = OpenAIEmbeddings(model=embedding_model)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=64)
+    results = []
+    
+    for path in doc_paths:
+        try:
+            docs = UnstructuredFileLoader(path).load()
+            chunks = splitter.split_documents(docs)
+            texts = [c.page_content for c in chunks]
+            vectors = embedder.embed_documents(texts)
+            results.extend(zip(texts, vectors, [c.metadata for c in chunks]))
+        except Exception as e:
+            print(f"Failed {path}: {e}")  # Don't let one bad doc fail the batch
+    return results
+
+def ingest_at_scale(doc_paths: list, batch_size: int = 100):
+    batches = [doc_paths[i:i+batch_size] for i in range(0, len(doc_paths), batch_size)]
+    futures = [process_document_batch.remote(b, "text-embedding-3-large") for b in batches]
+    all_results = ray.get(futures)
+    return [item for batch in all_results for item in batch]
+
+# CHALLENGE 2: VECTOR DB SELECTION
+# 5M vectors (1M docs × ~5 chunks each, 1536 dims):
+# Raw vectors: 5M × 1536 × 4 bytes ≈ 30GB
+# Plus HNSW graph + metadata: ~60-100GB total
+#
+# DB selection guide:
+# Pinecone   → 10M-1B vecs  | Managed, serverless, auto-sharding
+# Weaviate   → 10M-100M     | Self-host, hybrid search native
+# Qdrant     → 1M-100M      | Best OSS performance, Rust-based
+# PGVector   → <5M vecs     | Good if already on Postgres
+# Milvus     → 100M-10B     | Petabyte scale, complex setup
+
+# CHALLENGE 3: INDEX TYPE — IVF-PQ reduces memory 10-20x
+# HNSW (default): ~80GB RAM for 5M vectors — fine for <5M
+# IVF-PQ: ~4GB RAM for 5M vectors — required at 100M+ scale
+# Tradeoff: IVF-PQ has ~5% lower recall vs HNSW
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import VectorParams, Distance, HnswConfigDiff, QuantizationConfig, ScalarQuantizationConfig
+
+client = QdrantClient("localhost", port=6333)
+client.create_collection(
+    collection_name="large_corpus",
+    vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+    hnsw_config=HnswConfigDiff(m=16, ef_construct=100),
+    quantization_config=QuantizationConfig(
+        scalar=ScalarQuantizationConfig(type="int8", quantile=0.99, always_ram=True)
+    )
+)
+
+# CHALLENGE 4: QUERY LATENCY — keep P99 < 200ms at scale
+# Technique 1: Pre-filter by metadata before ANN search (reduces search space 99%)
+search_result = client.search(
+    collection_name="large_corpus",
+    query_vector=query_embedding,
+    query_filter={"must": [
+        {"key": "department", "match": {"value": "finance"}},
+        {"key": "year", "range": {"gte": 2023}}
+    ]},
+    limit=10
+)
+
+# Technique 2: Semantic cache (see RAG-17 for full implementation)
+# Technique 3: Async batch embedding for ingestion pipelines
+```
+
+---
+
+**RAG-11. How do you handle incremental updates to a large document corpus in production?**
+
+In a 1M document corpus, documents are added, updated, and deleted continuously. You cannot re-embed the entire corpus on every change. Production systems use event-driven incremental indexing.
+
+> **Interview tip:** The key concept is **document-level versioning + change detection**. The production pattern is a CDC (change data capture) pipeline feeding an async ingestion queue. Most junior candidates describe batch reingestion — distinguish yourself by describing the event-driven approach.
+
+```python
+# Production architecture:
+#
+# [Document CMS / Database]
+#   │ (CDC events: INSERT / UPDATE / DELETE — e.g., Debezium → Kafka)
+#   ▼
+# [Message Queue — Kafka / SQS / Pub/Sub]
+#   │
+#   ▼
+# [Ingestion Worker — consumes events]
+#   INSERT: embed new chunks, upsert to vector DB
+#   UPDATE: delete old chunks by doc_id, embed new chunks, upsert
+#   DELETE: delete all chunks by doc_id from vector DB
+
+import hashlib
+
+def compute_doc_hash(content: str) -> str:
+    """Hash document content — only re-embed if content actually changed."""
+    return hashlib.sha256(content.encode()).hexdigest()
+
+class IncrementalIndexer:
+    def __init__(self, vectorstore, hash_store):  # hash_store = Redis
+        self.vectorstore = vectorstore
+        self.hash_store = hash_store
+
+    def upsert_document(self, doc_id: str, content: str, metadata: dict):
+        new_hash = compute_doc_hash(content)
+        existing_hash = self.hash_store.get(f"doc_hash:{doc_id}")
+
+        if existing_hash and existing_hash.decode() == new_hash:
+            return  # Content unchanged — skip re-embedding (saves cost)
+
+        # Delete old vectors for this document
+        self.vectorstore.delete(filter={"doc_id": doc_id})
+
+        # Chunk, embed, insert new vectors with doc_id in metadata
+        # ... chunking and embedding logic here ...
+        self.hash_store.set(f"doc_hash:{doc_id}", new_hash)
+
+    def delete_document(self, doc_id: str):
+        self.vectorstore.delete(filter={"doc_id": doc_id})
+        self.hash_store.delete(f"doc_hash:{doc_id}")
+```
+
+---
+
+**RAG-12. How do you evaluate retrieval quality at scale and what metrics do you track in production?**
+
+Retrieval quality is the most important determinant of RAG answer quality. Yet most teams only measure end-to-end answer quality. Production systems measure retrieval independently.
+
+> **Interview tip:** Name specific metrics: Recall@k, Precision@k, MRR, NDCG. Know how to compute them offline using a golden dataset. Know that retrieval can fail silently — end-to-end answer quality metrics often don't catch retrieval failures.
+
+```python
+import numpy as np
+from typing import List, Dict
+
+def recall_at_k(retrieved_ids: List[str], relevant_ids: List[str], k: int) -> float:
+    """What fraction of relevant docs appear in top-k retrieved?"""
+    retrieved_top_k = set(retrieved_ids[:k])
+    relevant = set(relevant_ids)
+    if not relevant:
+        return 0.0
+    return len(retrieved_top_k & relevant) / len(relevant)
+
+def precision_at_k(retrieved_ids: List[str], relevant_ids: List[str], k: int) -> float:
+    """Of the top-k retrieved, what fraction are actually relevant?"""
+    retrieved_top_k = retrieved_ids[:k]
+    relevant = set(relevant_ids)
+    return sum(1 for d in retrieved_top_k if d in relevant) / k
+
+def mean_reciprocal_rank(retrieved_ids: List[str], relevant_ids: List[str]) -> float:
+    """Rank of the first relevant document in the retrieved list."""
+    relevant = set(relevant_ids)
+    for rank, doc_id in enumerate(retrieved_ids, start=1):
+        if doc_id in relevant:
+            return 1.0 / rank
+    return 0.0
+
+def evaluate_retriever(retriever, golden_dataset: List[Dict]) -> Dict:
+    recall_scores, precision_scores, mrr_scores = [], [], []
+    for item in golden_dataset:
+        retrieved_docs = retriever.invoke(item["query"])
+        retrieved_ids = [d.metadata.get("doc_id") for d in retrieved_docs]
+        recall_scores.append(recall_at_k(retrieved_ids, item["relevant_doc_ids"], k=5))
+        precision_scores.append(precision_at_k(retrieved_ids, item["relevant_doc_ids"], k=5))
+        mrr_scores.append(mean_reciprocal_rank(retrieved_ids, item["relevant_doc_ids"]))
+    return {
+        "recall@5": np.mean(recall_scores),
+        "precision@5": np.mean(precision_scores),
+        "mrr": np.mean(mrr_scores)
+    }
+
+# Production benchmark targets:
+# Recall@5       > 0.85   (most relevant chunk in top 5)
+# Precision@5    > 0.50   (at least half of top 5 are useful)
+# MRR            > 0.70   (first relevant chunk is near top)
+# Faithfulness   > 0.90   (LLM doesn't hallucinate from context)
+# Answer Rel.    > 0.80   (answer addresses the question)
+```
+
+---
+
+## Structured & Tabular RAG — FinTech Accuracy
+
+---
+
+**RAG-13. How do you build a production-grade RAG system over tabular data where precision is critical — for example in a FinTech company?**
+
+Standard vector similarity search over prose chunks fails for tabular/structured data. Numbers, dates, and categorical values need exact matching, not semantic similarity. A financial analyst asking "What was EBITDA margin in Q3 2024?" needs the exact number, not a semantically similar paragraph.
+
+> **Interview tip:** This is one of the most important production RAG questions. The correct answer is a **hybrid architecture**: Text-to-SQL for structured queries + vector RAG for unstructured narrative + a classifier/router to decide which path handles each query. Companies like Stripe, Bloomberg, and Palantir use this pattern.
+
+```python
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_community.utilities import SQLDatabase
+from langchain.chains import create_sql_query_chain
+from pydantic import BaseModel
+from enum import Enum
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+# Step 1: Route the query — structured (SQL) vs unstructured (RAG)
+class QueryType(str, Enum):
+    SQL = "sql"          # Numbers, aggregations, filters, comparisons
+    RAG = "rag"          # Definitions, policies, narrative analysis
+    HYBRID = "hybrid"    # Needs both (e.g., "explain the Q3 revenue drop")
+
+class QueryRoute(BaseModel):
+    query_type: QueryType
+    reasoning: str
+
+ROUTER_PROMPT = """Classify this financial query:
+- SQL: asks for specific numbers, calculations, time-series, comparisons (revenue, EBITDA, ratios)
+- RAG: asks for definitions, policies, qualitative analysis, document content
+- HYBRID: needs both structured data AND narrative context
+
+Query: {query}"""
+
+structured_router_llm = llm.with_structured_output(QueryRoute)
+
+# Step 2: SQL path — natural language → SQL → execute → verify
+db = SQLDatabase.from_uri(
+    "postgresql://user:pass@host/fintech_db",
+    include_tables=["revenue", "expenses", "balance_sheet", "transactions"],
+    sample_rows_in_table_info=2   # show LLM the schema with sample rows
+)
+sql_chain = create_sql_query_chain(llm, db)
+
+# Production SQL safety: never allow write operations
+SAFE_SQL_PREFIXES = ("SELECT", "WITH")
+def execute_safe_sql(query: str, db: SQLDatabase) -> str:
+    clean_query = query.strip().upper()
+    if not any(clean_query.startswith(p) for p in SAFE_SQL_PREFIXES):
+        raise ValueError(f"Non-SELECT query blocked: {query[:100]}")
+    return db.run(query)
+
+# Step 3: Full hybrid pipeline
+async def financial_rag_query(user_query: str) -> dict:
+    route = await structured_router_llm.ainvoke(ROUTER_PROMPT.format(query=user_query))
+
+    if route.query_type == QueryType.SQL:
+        sql = await sql_chain.ainvoke({"question": user_query})
+        result = execute_safe_sql(sql, db)
+        # Format the raw SQL result into a natural language answer
+        formatted = await llm.ainvoke(
+            f"SQL result: {result}\n\nUser question: {user_query}\n\n"
+            f"Provide a clear, precise answer. State the exact numbers."
+        )
+        return {"answer": formatted.content, "sql": sql, "raw_result": result}
+
+    elif route.query_type == QueryType.RAG:
+        docs = retriever.invoke(user_query)
+        context = "\n".join(d.page_content for d in docs)
+        answer = await llm.ainvoke(f"Context: {context}\n\nQuestion: {user_query}")
+        return {"answer": answer.content, "sources": [d.metadata for d in docs]}
+
+    else:  # HYBRID
+        import asyncio
+        sql_task = asyncio.create_task(
+            sql_chain.ainvoke({"question": user_query})
+        )
+        rag_task = asyncio.create_task(retriever.ainvoke(user_query))
+        sql_result, rag_docs = await asyncio.gather(sql_task, rag_task)
+        sql_data = execute_safe_sql(sql_result, db)
+        rag_context = "\n".join(d.page_content for d in rag_docs)
+        combined = await llm.ainvoke(
+            f"Structured data:\n{sql_data}\n\nNarrative context:\n{rag_context}\n\n"
+            f"Question: {user_query}\n\nProvide a comprehensive answer citing both sources."
+        )
+        return {"answer": combined.content, "sql": sql_result, "sources": [d.metadata for d in rag_docs]}
+```
+
+---
+
+**RAG-14. What are the unique challenges of RAG over financial tables and how do you handle each?**
+
+Financial tables have four unique properties that break standard RAG: hierarchical structure (header rows, merged cells), implicit context (column headers matter as much as cell values), temporal indexing (same metric at different time periods), and precision requirements (a 0.1% error in a financial ratio matters).
+
+> **Interview tip:** Candidates who've worked on FinTech RAG will mention the table serialization problem. How you convert a table to text determines retrieval quality more than any other single factor for tabular data.
+
+```python
+import pandas as pd
+from langchain_core.documents import Document
+
+# CHALLENGE 1: TABLE SERIALIZATION
+# Naive: df.to_string() → loses structure, LLM struggles to parse
+# Production: row-as-sentence serialization that preserves column semantics
+
+def serialize_financial_table(df: pd.DataFrame, table_name: str, period: str) -> str:
+    lines = [f"TABLE: {table_name} | PERIOD: {period}"]
+    lines.append(f"Columns: {', '.join(df.columns.tolist())}")
+    lines.append("")
+    for _, row in df.iterrows():
+        parts = []
+        for col, val in row.items():
+            if pd.notna(val):
+                parts.append(f"{col}: {val}")
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
+
+# Output example:
+# TABLE: Income Statement | PERIOD: Q3 2024
+# Metric: Revenue | Q3_2024: $2.1B | Q3_2023: $1.8B | YoY_Change: +16.7%
+# Metric: EBITDA | Q3_2024: $420M | Q3_2023: $360M | YoY_Change: +16.7%
+
+# CHALLENGE 2: METADATA TAGGING — enable precision filtering
+def create_financial_chunks(df: pd.DataFrame, metadata: dict) -> list[Document]:
+    """One Document per row for maximum retrieval precision."""
+    docs = []
+    for _, row in df.iterrows():
+        content = " | ".join(f"{col}: {val}" for col, val in row.items() if pd.notna(val))
+        doc_metadata = {
+            **metadata,
+            "metric": row.get("Metric", ""),
+            "period": row.get("Period", ""),
+            "value": str(row.get("Value", "")),
+        }
+        docs.append(Document(page_content=content, metadata=doc_metadata))
+    return docs
+
+# CHALLENGE 3: NUMERIC PRECISION — validate numbers with structured output
+from pydantic import BaseModel, validator
+
+class FinancialAnswer(BaseModel):
+    metric_name: str
+    value: float
+    unit: str           # "USD millions", "percent", "ratio"
+    period: str         # "Q3 2024"
+    source_table: str
+    exact_quote: str    # The exact string from the source — forces grounding
+
+# CHALLENGE 4: CALCULATION QUERIES — use code execution, not LLM arithmetic
+# Never trust LLMs to do arithmetic on financial data.
+from langchain_core.tools import tool
+
+@tool
+def calculate_financial_ratio(numerator: float, denominator: float, ratio_name: str) -> str:
+    """Safely calculate a financial ratio using code, not LLM inference."""
+    if denominator == 0:
+        return f"Cannot compute {ratio_name}: denominator is zero"
+    result = numerator / denominator
+    return f"{ratio_name} = {numerator} / {denominator} = {result:.4f}"
+
+# Example: "What is the P/E ratio?"
+# → SQL retrieves: price=$150, EPS=$5
+# → Tool computes: 150 / 5 = 30.0 (code, not LLM)
+# → LLM formats: "The P/E ratio is 30.0x (price $150 / EPS $5.00)"
+```
+
+---
+
+**RAG-15. How do you build a RAG system over mixed data sources — PDFs, databases, spreadsheets, and APIs — in a FinTech context?**
+
+Enterprise FinTech data lives in many places: regulatory filings as PDFs, transaction data in Postgres, models in Excel, and market data from APIs. A production system must federate these sources transparently.
+
+> **Interview tip:** The key pattern is the **retrieval federation layer** — a unified interface that dispatches queries to the right data source. This is architecturally similar to a data mesh at the retrieval layer.
+
+```python
+from abc import ABC, abstractmethod
+from langchain_core.documents import Document
+from typing import List
+
+class DataSourceRetriever(ABC):
+    @abstractmethod
+    async def retrieve(self, query: str, metadata_filter: dict = None) -> List[Document]:
+        pass
+    
+    @abstractmethod
+    def handles(self, query: str) -> bool:
+        """Return True if this retriever is appropriate for this query."""
+        pass
+
+class PDFDocumentRetriever(DataSourceRetriever):
+    """For regulatory filings, research reports, policy documents."""
+    def __init__(self, vectorstore):
+        self.retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+    
+    async def retrieve(self, query, metadata_filter=None):
+        return await self.retriever.ainvoke(query)
+    
+    def handles(self, query):
+        keywords = ["policy", "regulation", "filing", "report", "clause", "section"]
+        return any(k in query.lower() for k in keywords)
+
+class SQLDatabaseRetriever(DataSourceRetriever):
+    """For transaction data, account balances, time-series financial data."""
+    def __init__(self, db, llm):
+        self.chain = create_sql_query_chain(llm, db)
+        self.db = db
+    
+    async def retrieve(self, query, metadata_filter=None):
+        sql = await self.chain.ainvoke({"question": query})
+        result = self.db.run(sql)
+        return [Document(page_content=result, metadata={"source": "sql", "query": sql})]
+    
+    def handles(self, query):
+        keywords = ["revenue", "balance", "transaction", "amount", "total", "average", "count"]
+        return any(k in query.lower() for k in keywords)
+
+class FederatedRetriever:
+    """Routes queries to the appropriate data source(s) and merges results."""
+    def __init__(self, retrievers: List[DataSourceRetriever]):
+        self.retrievers = retrievers
+    
+    async def retrieve(self, query: str) -> List[Document]:
+        import asyncio
+        capable = [r for r in self.retrievers if r.handles(query)]
+        if not capable:
+            capable = self.retrievers  # fallback: try all
+        
+        results = await asyncio.gather(*[r.retrieve(query) for r in capable], return_exceptions=True)
+        all_docs = []
+        for result in results:
+            if isinstance(result, list):
+                all_docs.extend(result)
+        return all_docs
+```
+
+---
+
+## Production Architecture & MLOps for RAG
+
+---
+
+**RAG-16. How do you implement a production-grade RAG system with proper observability and monitoring?**
+
+A production RAG system without observability is flying blind. Production monitoring covers four planes: infrastructure (latency, uptime), retrieval quality (recall, precision), generation quality (faithfulness, relevancy), and business outcomes (user satisfaction, task completion rate).
+
+> **Interview tip:** LangSmith is the most common answer, but senior engineers go further. They describe custom dashboards, alerting thresholds, and the distinction between online metrics (available in real-time) and offline metrics (computed in batch over a golden dataset).
+
+```python
+import time, uuid, logging
+from dataclasses import dataclass, field
+from typing import Optional, List
+from datetime import datetime
+
+@dataclass
+class RAGTrace:
+    trace_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    query: str = ""
+    rewritten_query: Optional[str] = None
+    retrieved_doc_ids: List[str] = field(default_factory=list)
+    retrieved_doc_scores: List[float] = field(default_factory=list)
+    context_length_tokens: int = 0
+    answer: str = ""
+    faithfulness_score: Optional[float] = None
+    answer_relevancy_score: Optional[float] = None
+    retrieval_latency_ms: float = 0.0
+    generation_latency_ms: float = 0.0
+    total_latency_ms: float = 0.0
+    user_feedback: Optional[str] = None   # "thumbs_up" / "thumbs_down"
+    error: Optional[str] = None
+
+class ObservableRAGPipeline:
+    def __init__(self, retriever, llm, tracer_backend):
+        self.retriever = retriever
+        self.llm = llm
+        self.tracer = tracer_backend
+
+    async def query(self, user_query: str) -> dict:
+        trace = RAGTrace(query=user_query)
+        t_start = time.perf_counter()
+        try:
+            t_retr = time.perf_counter()
+            docs = await self.retriever.ainvoke(user_query)
+            trace.retrieval_latency_ms = (time.perf_counter() - t_retr) * 1000
+            trace.retrieved_doc_ids = [d.metadata.get("doc_id", "") for d in docs]
+
+            context = "\n\n".join(d.page_content for d in docs)
+            t_gen = time.perf_counter()
+            response = await self.llm.ainvoke(
+                f"Context:\n{context}\n\nQuestion: {user_query}"
+            )
+            trace.generation_latency_ms = (time.perf_counter() - t_gen) * 1000
+            trace.answer = response.content
+
+        except Exception as e:
+            trace.error = str(e)
+            raise
+        finally:
+            trace.total_latency_ms = (time.perf_counter() - t_start) * 1000
+            await self.tracer.log(trace)
+            # Emit to Prometheus/Datadog:
+            # metrics.histogram("rag.latency.total_ms", trace.total_latency_ms)
+            # metrics.histogram("rag.latency.retrieval_ms", trace.retrieval_latency_ms)
+
+        return {"answer": trace.answer, "trace_id": trace.trace_id}
+
+# Production alerting thresholds:
+ALERT_THRESHOLDS = {
+    "p99_latency_ms": 3000,         # Alert if P99 > 3 seconds
+    "faithfulness_score": 0.85,     # Alert if daily avg faithfulness < 0.85
+    "error_rate": 0.01,             # Alert if error rate > 1%
+    "retrieval_recall_at_5": 0.80   # Alert if recall drops below 0.80
+}
+```
+
+---
+
+**RAG-17. How do you implement semantic caching in a production RAG system?**
+
+Semantic caching stores results of previous RAG queries and returns cached answers when a new query is semantically similar. This reduces latency from ~2s to ~50ms and cuts LLM costs by 30–60% in production.
+
+> **Interview tip:** Semantic caching is different from exact-match caching. The threshold is critical — too tight misses paraphrases, too loose returns wrong cached answers. For FinTech, use threshold ≥ 0.95. For general assistants, 0.92 is common.
+
+```python
+import json, hashlib
+import numpy as np
+from redis import Redis
+from langchain_openai import OpenAIEmbeddings
+from typing import Optional
+from datetime import datetime
+
+class SemanticCache:
+    def __init__(
+        self,
+        redis_client: Redis,
+        embedder: OpenAIEmbeddings,
+        similarity_threshold: float = 0.95,  # Very tight for FinTech
+        ttl_seconds: int = 3600
+    ):
+        self.redis = redis_client
+        self.embedder = embedder
+        self.threshold = similarity_threshold
+        self.ttl = ttl_seconds
+
+    def _cosine_similarity(self, a: list, b: list) -> float:
+        a, b = np.array(a), np.array(b)
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+    async def get(self, query: str) -> Optional[str]:
+        query_embedding = self.embedder.embed_query(query)
+        cache_keys = self.redis.keys("semantic_cache:*")
+        
+        for key in cache_keys:
+            entry = json.loads(self.redis.get(key))
+            similarity = self._cosine_similarity(query_embedding, entry["embedding"])
+            if similarity >= self.threshold:
+                return entry["answer"]
+        return None
+
+    async def set(self, query: str, answer: str):
+        query_embedding = self.embedder.embed_query(query)
+        cache_key = f"semantic_cache:{hashlib.sha256(query.encode()).hexdigest()}"
+        entry = {
+            "query": query,
+            "embedding": query_embedding,
+            "answer": answer,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        self.redis.setex(cache_key, self.ttl, json.dumps(entry))
+
+async def rag_with_semantic_cache(query: str, cache: SemanticCache, rag_chain) -> str:
+    cached_answer = await cache.get(query)
+    if cached_answer:
+        return cached_answer   # ~50ms vs ~2000ms
+    answer = await rag_chain.ainvoke(query)
+    await cache.set(query, answer)
+    return answer
+```
+
+---
+
+**RAG-18. How do you version and manage your RAG knowledge base in production?**
+
+A RAG knowledge base is a live artifact. Documents get updated, embedding models get upgraded, and chunking strategies change. Without versioning, you cannot roll back a bad ingestion, A/B test retrieval strategies, or audit which document version was used for a past answer.
+
+> **Interview tip:** Treat the vector index like a model artifact — version it, test before promoting, support rollback. Use blue/green deployment for major index updates. Most candidates miss this entirely.
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class IndexVersion:
+    version_id: str
+    embedding_model: str
+    chunking_strategy: str
+    doc_count: int
+    vector_count: int
+    created_at: str
+    status: str              # "staging" | "active" | "deprecated"
+    eval_scores: dict        # {"recall@5": 0.87, "faithfulness": 0.91}
+
+class KnowledgeBaseVersionManager:
+    def __init__(self, metadata_store):
+        self.metadata = metadata_store
+
+    def promote_to_active(self, version_id: str, min_recall: float = 0.85):
+        """Promote a staging index only if it meets quality thresholds."""
+        version = self.metadata.get_version(version_id)
+        
+        if version.status != "staging":
+            raise ValueError(f"Can only promote staging versions, got: {version.status}")
+        
+        recall = version.eval_scores.get("recall@5", 0)
+        if recall < min_recall:
+            raise ValueError(
+                f"Version {version_id} has recall@5={recall:.3f} < threshold {min_recall}. "
+                f"Deployment blocked."
+            )
+        
+        # Deprecate current active
+        current_active = self.metadata.get_active_version()
+        if current_active:
+            self.metadata.update_status(current_active.version_id, "deprecated")
+        
+        self.metadata.update_status(version_id, "active")
+
+    def rollback(self):
+        """Roll back to the most recently deprecated version."""
+        deprecated = self.metadata.get_most_recent_deprecated()
+        if not deprecated:
+            raise RuntimeError("No deprecated version available for rollback")
+        current_active = self.metadata.get_active_version()
+        self.metadata.update_status(current_active.version_id, "deprecated")
+        self.metadata.update_status(deprecated.version_id, "active")
+```
+
+---
+
+**RAG-19. How do you use RAGAS to evaluate a RAG pipeline in production?**
+
+RAGAS is the standard evaluation framework for RAG. It measures four dimensions: faithfulness, answer relevancy, context precision, and context recall — all using an LLM as judge, making it scalable to thousands of queries.
+
+> **Interview tip:** Know all four metrics and what a bad score tells you about which component to fix. Most candidates know faithfulness but not context precision vs context recall — distinguish yourself.
+
+```python
+from ragas import evaluate
+from ragas.metrics import (
+    faithfulness,       # Does the answer contain only info from the context?
+    answer_relevancy,   # Does the answer address the question asked?
+    context_precision,  # Are the retrieved chunks actually useful?
+    context_recall,     # Did retrieval find all relevant information?
+)
+from datasets import Dataset
+
+eval_data = {
+    "question": ["What is the company's revenue growth target?"],
+    "answer": ["The company targets 15% YoY revenue growth."],
+    "contexts": [["[chunk] 2024 Strategic Plan... 15% annual revenue growth target..."]],
+    "ground_truth": ["The company's policy is 15% annual revenue growth."]
+}
+
+dataset = Dataset.from_dict(eval_data)
+results = evaluate(dataset, metrics=[faithfulness, answer_relevancy, context_precision, context_recall])
+
+# Interpreting results:
+# faithfulness < 0.85     → LLM is hallucinating; strengthen system prompt or add guardrails
+# answer_relevancy < 0.80 → LLM is going off-topic; check prompt or query routing
+# context_precision < 0.70 → Too many irrelevant chunks; improve reranking
+# context_recall < 0.80   → Missing relevant docs; improve retrieval (hybrid search)
+```
+
+---
+
+**RAG-20. How do you build a golden dataset for RAG evaluation?**
+
+A golden dataset is a curated set of (question, ground_truth_answer, relevant_doc_ids) triples. It is the most important evaluation artifact for a RAG system, but most teams either don't have one or let it go stale.
+
+> **Interview tip:** Three creation strategies: human annotation (expensive, highest quality), synthetic generation with LLMs (scalable, needs validation), and production query mining with expert review (best ROI). Name all three.
+
+```python
+from langchain_openai import ChatOpenAI
+from langchain_core.documents import Document
+import json
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
+
+QUESTION_GEN_PROMPT = """Given the following document chunk, generate {n_questions} 
+diverse questions answerable using ONLY this text.
+Include factual, comparative, and "why/how" questions.
+Return as a JSON list of strings.
+
+Document:
+{chunk}
+
+Questions:"""
+
+async def generate_eval_questions(doc: Document, n: int = 3):
+    response = await llm.ainvoke(
+        QUESTION_GEN_PROMPT.format(chunk=doc.page_content, n_questions=n)
+    )
+    try:
+        return json.loads(response.content)
+    except json.JSONDecodeError:
+        return []
+
+# Keeping the golden dataset fresh:
+# - Add 20-50 new questions per month from real production queries
+# - Remove questions covering deprecated features/policies
+# - Re-validate against updated documents when source docs change
+# - Track coverage: what % of your golden dataset covers each major topic?
+
+def check_dataset_coverage(golden_dataset: list, topic_categories: list) -> dict:
+    coverage = {topic: 0 for topic in topic_categories}
+    for item in golden_dataset:
+        for topic in topic_categories:
+            if topic.lower() in item["question"].lower():
+                coverage[topic] += 1
+    return {topic: count / len(golden_dataset) for topic, count in coverage.items()}
+```
+
+---
+
+## Advanced Retrieval Patterns
+
+---
+
+**RAG-21. What is Corrective RAG (CRAG) and when should you use it?**
+
+Corrective RAG adds a self-correction step after retrieval: it evaluates retrieved documents for relevance, and if they are insufficient, either performs web search or returns a "cannot answer" signal. It dramatically reduces hallucination from failed retrieval.
+
+> **Interview tip:** CRAG is commonly implemented as a LangGraph workflow with conditional edges. It is the production pattern for high-stakes applications where answering from insufficient context is worse than saying "I don't know."
+
+```python
+from langgraph.graph import StateGraph, START, END
+from typing import TypedDict, List
+from langchain_core.documents import Document
+import json
+
+class CRAGState(TypedDict):
+    query: str
+    documents: List[Document]
+    document_grade: str      # "relevant" | "irrelevant"
+    transformed_query: str
+    answer: str
+    source: str              # "knowledge_base" | "web_search"
+
+def retrieve(state: CRAGState) -> CRAGState:
+    docs = retriever.invoke(state["query"])
+    return {**state, "documents": docs}
+
+GRADER_PROMPT = """Assess if this document contains information to answer the question.
+Return JSON: {{"grade": "relevant" | "irrelevant"}}
+
+Question: {question}
+Document: {document}"""
+
+def grade_documents(state: CRAGState) -> CRAGState:
+    grades = []
+    for doc in state["documents"]:
+        result = llm.invoke(GRADER_PROMPT.format(
+            question=state["query"], document=doc.page_content
+        ))
+        grade_data = json.loads(result.content)
+        grades.append(grade_data["grade"])
+    overall = "relevant" if grades.count("relevant") >= len(grades) / 2 else "irrelevant"
+    return {**state, "document_grade": overall}
+
+def rewrite_query(state: CRAGState) -> CRAGState:
+    rewritten = llm.invoke(
+        f"Rewrite for a web search engine:\n{state['query']}"
+    )
+    return {**state, "transformed_query": rewritten.content}
+
+def web_search(state: CRAGState) -> CRAGState:
+    from langchain_community.tools.tavily_search import TavilySearchResults
+    results = TavilySearchResults(max_results=3).invoke(state["transformed_query"])
+    web_docs = [Document(page_content=r["content"], metadata={"source": r["url"]})
+                for r in results]
+    return {**state, "documents": web_docs, "source": "web_search"}
+
+graph = StateGraph(CRAGState)
+graph.add_node("retrieve", retrieve)
+graph.add_node("grade_documents", grade_documents)
+graph.add_node("rewrite_query", rewrite_query)
+graph.add_node("web_search", web_search)
+graph.add_node("generate", generate_answer)
+
+graph.add_edge(START, "retrieve")
+graph.add_edge("retrieve", "grade_documents")
+graph.add_conditional_edges(
+    "grade_documents",
+    lambda s: "generate" if s["document_grade"] == "relevant" else "rewrite_query"
+)
+graph.add_edge("rewrite_query", "web_search")
+graph.add_edge("web_search", "generate")
+graph.add_edge("generate", END)
+
+crag_app = graph.compile()
+```
+
+---
+
+**RAG-22. What is Agentic RAG and how does it handle multi-hop questions?**
+
+Agentic RAG treats retrieval as a tool that an LLM agent can call iteratively. For multi-hop questions (e.g., "What is the revenue of the company that acquired Startup X in 2023?"), the agent retrieves Step 1 ("who acquired Startup X?"), then uses that answer to retrieve Step 2 ("what is that company's revenue?"). Standard RAG fails at multi-hop because all retrieval happens in a single pass.
+
+> **Interview tip:** Implemented as a ReAct agent with retrieval as a tool. Key production concern: loop detection — agents can get stuck in cycles. Always set a recursion limit. Name both the pattern and the risk.
+
+```python
+from langgraph.prebuilt import create_react_agent
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+
+@tool
+def search_knowledge_base(query: str) -> str:
+    """Search the knowledge base for specific facts, documents, or data.
+    Break complex questions into multiple targeted searches."""
+    docs = retriever.invoke(query)
+    if not docs:
+        return "No relevant information found in the knowledge base."
+    return "\n\n---\n\n".join(
+        f"Source: {d.metadata.get('source', 'unknown')}\n{d.page_content}"
+        for d in docs
+    )
+
+@tool
+def search_financial_database(description: str) -> str:
+    """Query the financial database in plain English.
+    Use for precise numerical data: revenue, expenses, ratios, time-series."""
+    sql = sql_chain.invoke({"question": description})
+    return db.run(sql)
+
+agentic_rag = create_react_agent(
+    model=ChatOpenAI(model="gpt-4o", temperature=0),
+    tools=[search_knowledge_base, search_financial_database],
+    state_modifier="""You are a precise research assistant.
+    For complex questions, break them into sub-questions and retrieve step by step.
+    Always cite your sources. Never answer from memory — always use the provided tools.
+    If you cannot find information after 3 searches, state that clearly."""
+)
+
+# Multi-hop example:
+# Q: "What is the D/E ratio of the company that acquired FinCorp in 2023?"
+# Step 1: search_knowledge_base("acquisition of FinCorp 2023") → "AcquiCo acquired FinCorp"
+# Step 2: search_financial_database("AcquiCo debt-to-equity ratio") → "D/E = 1.4"
+# Answer: "AcquiCo's D/E ratio is 1.4 [Source: 2023 Annual Report, Financial DB]"
+```
+
+---
+
+## RAG Security & Compliance
+
+---
+
+**RAG-23. What are the security risks in a production RAG system and how do you mitigate them?**
+
+RAG introduces unique security risks: prompt injection through document content, data leakage across tenants, and retrieval of unauthorized documents.
+
+> **Interview tip:** Three categories: prompt injection (through documents), authorization bypass (multi-tenant access control), and PII leakage (sensitive data in retrieved chunks). Name all three with concrete mitigations.
+
+```python
+import re
+
+# RISK 1: PROMPT INJECTION VIA DOCUMENT CONTENT
+INJECTION_PATTERNS = [
+    r"ignore (previous|prior|all) instructions",
+    r"system prompt",
+    r"you are now",
+    r"disregard your (guidelines|rules|instructions)",
+]
+
+def sanitize_retrieved_content(content: str) -> str:
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, content, re.IGNORECASE):
+            import logging
+            logging.warning(f"Potential injection in document: {content[:100]}")
+            content = re.sub(pattern, "[FILTERED CONTENT]", content, flags=re.IGNORECASE)
+    return content
+
+def wrap_context_safely(docs: list) -> str:
+    """XML delimiting separates instructions from data — reduces injection risk."""
+    sanitized = [sanitize_retrieved_content(d.page_content) for d in docs]
+    return f"<retrieved_context>\n{chr(10).join(sanitized)}\n</retrieved_context>"
+
+# RISK 2: MULTI-TENANT ACCESS CONTROL
+# Filter must be applied at vector DB level — not application layer
+def get_authorized_retriever(user_id: str, user_permissions: list):
+    authorized_filter = {
+        "must": [
+            {"key": "org_id", "match": {"value": get_user_org(user_id)}},
+            {"key": "access_level", "match": {"any": user_permissions}}
+        ]
+    }
+    return vectorstore.as_retriever(
+        search_kwargs={"k": 6, "filter": authorized_filter}
+    )
+    # Critical: DB-layer filtering cannot be bypassed; application-layer filtering can
+
+# RISK 3: PII IN RETRIEVED CHUNKS — scrub at ingestion time
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+
+analyzer = AnalyzerEngine()
+anonymizer = AnonymizerEngine()
+
+def scrub_pii_from_chunk(text: str) -> str:
+    results = analyzer.analyze(text=text, language="en")
+    return anonymizer.anonymize(text=text, analyzer_results=results).text
+    # "John Smith's SSN is 123-45-6789" → "<PERSON>'s SSN is <US_SSN>"
+```
+
+---
+
+**RAG-24. How do you implement GDPR right-to-erasure (right to be forgotten) in a RAG system?**
+
+GDPR's right to erasure means that when a user requests deletion of their data, all copies must be deleted — including any vector embeddings derived from their documents. This is the "right to be forgotten" problem for RAG: embeddings are derived data and must be purged too.
+
+> **Interview tip:** The production pipeline is: delete source document → find all embeddings by doc_id → delete embeddings → invalidate cache → log the deletion for audit. Always audit even failed deletions.
+
+```python
+from datetime import datetime, timedelta
+
+class GDPRCompliantRAG:
+    def __init__(self, vectorstore, document_store, cache, audit_log):
+        self.vectorstore = vectorstore
+        self.document_store = document_store
+        self.cache = cache
+        self.audit_log = audit_log
+
+    async def delete_document(self, doc_id: str, requester_id: str, reason: str):
+        deletion_event = {
+            "doc_id": doc_id, "requester_id": requester_id, "reason": reason,
+            "timestamp": datetime.utcnow().isoformat(), "steps": []
+        }
+        try:
+            self.document_store.delete(doc_id)
+            deletion_event["steps"].append("document_store: deleted")
+            
+            self.vectorstore.delete(filter={"doc_id": doc_id})
+            deletion_event["steps"].append("vector_store: embeddings deleted")
+            
+            self.cache.delete_by_pattern(f"*{doc_id}*")
+            deletion_event["steps"].append("cache: invalidated")
+            
+            deletion_event["status"] = "completed"
+        except Exception as e:
+            deletion_event["status"] = "failed"
+            deletion_event["error"] = str(e)
+            raise
+        finally:
+            self.audit_log.write(deletion_event)  # Always audit, even failures
+```
+
+---
+
+**RAG-25. How do you handle contradictory information across retrieved documents?**
+
+In a large corpus, the same question may have conflicting answers in different documents (e.g., a policy updated in Q2 contradicts the Q1 version). Naive RAG stuffs both into context and lets the LLM pick — which often produces confused answers.
+
+> **Interview tip:** Production resolution hierarchy: (1) most recent version wins for versioned docs, (2) primary source beats secondary source, (3) if unresolvable, disclose the conflict to the user rather than silently averaging. Name all three.
+
+```python
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime
+import json
+
+class ConflictDetectionResult(BaseModel):
+    has_conflict: bool
+    conflicting_claims: List[str]
+    resolution: str  # "use_most_recent" | "use_authoritative" | "present_both" | "escalate"
+
+CONFLICT_DETECTOR_PROMPT = """Analyze these documents for contradictions regarding the question.
+Documents: {documents}
+Question: {question}
+Return JSON: {{"has_conflict": true/false, "conflicting_claims": [...], 
+"resolution": "use_most_recent|present_both|escalate"}}"""
+
+async def retrieve_with_conflict_resolution(query: str) -> dict:
+    docs = await retriever.ainvoke(query)
+    
+    # Sort by recency — most recent is most authoritative for versioned policies
+    docs_sorted = sorted(
+        docs,
+        key=lambda d: datetime.fromisoformat(d.metadata.get("last_updated", "2000-01-01")),
+        reverse=True
+    )
+    
+    docs_summary = "\n---\n".join(
+        f"[{d.metadata.get('source','?')} | {d.metadata.get('last_updated','?')}]\n{d.page_content[:400]}"
+        for d in docs_sorted
+    )
+    
+    conflict_result = await structured_llm.ainvoke(
+        CONFLICT_DETECTOR_PROMPT.format(documents=docs_summary, question=query)
+    )
+    
+    if conflict_result.has_conflict:
+        if conflict_result.resolution == "use_most_recent":
+            context = docs_sorted[0].page_content
+            disclaimer = f"\n\n⚠️ Multiple versions exist. Using most recent ({docs_sorted[0].metadata.get('last_updated')})."
+        elif conflict_result.resolution == "escalate":
+            return {
+                "answer": "Conflicting information found. Please consult a subject matter expert.",
+                "conflict": True
+            }
+        else:
+            context = docs_summary
+            disclaimer = "\n\n⚠️ Documents contain conflicting information. Both perspectives are presented."
+    else:
+        context = "\n\n".join(d.page_content for d in docs_sorted[:4])
+        disclaimer = ""
+    
+    answer = await llm.ainvoke(f"Context: {context}\n\nQuestion: {query}")
+    return {"answer": answer.content + disclaimer, "conflict": conflict_result.has_conflict}
+```
+
+---
+
+**RAG-26. What is the difference between Naive RAG, Advanced RAG, and Modular RAG?**
+
+These are the three generations of RAG architecture. Knowing the distinctions signals depth of experience and keeps interviewers from using outdated patterns as baselines.
+
+> **Interview tip:** This taxonomy comes from the "RAG Survey" paper (Gao et al., 2023). Production systems at mature AI companies operate at the Modular RAG level. Cite specific components that distinguish each generation.
+
+```
+NAIVE RAG (2020-2022):
+  Indexing:  Fixed-size chunking → embedding → vector store
+  Retrieval: Single-pass similarity search, top-k
+  Generation: Stuff all chunks into prompt → LLM generates
+  Problems:  Low retrieval precision, context overflow, no self-correction
+
+ADVANCED RAG (2023):
+  Adds pre-retrieval:  Query rewriting, HyDE, step-back prompting
+  Adds post-retrieval: Cross-encoder reranking, contextual compression
+  Better chunking:     Semantic, parent-child, proposition-level
+  Better indexing:     Metadata enrichment, hierarchical indices
+  Problems:  Linear pipeline, no feedback loops, single-source
+
+MODULAR RAG (2024+):
+  Adaptive retrieval:  Agent decides when/what to retrieve
+  Iterative retrieval: Retrieve → read → retrieve again if needed
+  Self-correction:     CRAG, Self-RAG patterns
+  Multi-source:        Vector DB + SQL + API + web
+  Graph-based:         RAG over knowledge graphs (GraphRAG)
+  Production examples: Perplexity AI, Glean, Notion AI
+  Implementation:      LangGraph workflows with conditional routing
+```
+
+---
+
+**RAG-27. How do you handle multi-modal RAG — combining text, tables, and images?**
+
+Enterprise documents (financial reports, scientific papers, product manuals) contain text, tables, and figures. Standard RAG only handles text. Multi-modal RAG retrieves and reasons over all content types.
+
+> **Interview tip:** Two production architectures: (1) extract-and-describe (use vision LLMs to describe images/tables as text, then embed descriptions), and (2) multi-modal embeddings (embed images and text in the same vector space). Architecture (1) is the production standard because it is more controllable and auditable.
+
+```python
+import base64
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+from langchain_core.documents import Document
+
+vision_llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+def extract_table_as_text(table_image_bytes: bytes, context: str = "") -> str:
+    """Use vision LLM to convert a table image to structured text."""
+    b64 = base64.b64encode(table_image_bytes).decode()
+    message = HumanMessage(content=[
+        {"type": "text", "text": f"""Extract all data from this table as structured text.
+Use format: [Row N] Col1: Value | Col2: Value | ...
+Preserve all numbers exactly. Do not round or approximate.
+Context: {context}"""},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+    ])
+    return vision_llm.invoke([message]).content
+
+def extract_figure_as_text(figure_bytes: bytes, surrounding_text: str = "") -> str:
+    """Describe a figure/chart for text-based retrieval."""
+    b64 = base64.b64encode(figure_bytes).decode()
+    message = HumanMessage(content=[
+        {"type": "text", "text": f"""Describe this figure for a search index. Include:
+1. Chart type (bar, line, pie, scatter, etc.)
+2. Key data points and their values (exact numbers)
+3. Trends or patterns shown
+4. Units, time periods, title, axis labels
+Context: {surrounding_text[:500]}"""},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+    ])
+    return vision_llm.invoke([message]).content
+
+# At ingestion: each table/figure becomes a Document with content_type metadata
+def process_document_multimodal(pdf_path: str) -> list:
+    docs = []
+    # Extract tables → serialize as text Documents
+    docs.append(Document(
+        page_content=extract_table_as_text(table_bytes, context=pdf_path),
+        metadata={"source": pdf_path, "content_type": "table", "page": page_num}
+    ))
+    # Extract figures → describe as text Documents
+    docs.append(Document(
+        page_content=extract_figure_as_text(figure_bytes, nearby_text),
+        metadata={"source": pdf_path, "content_type": "figure", "page": page_num}
+    ))
+    return docs
+```
+
+---
+
+**RAG-28. How do you implement streaming responses in a production RAG system?**
+
+Users expect progressive token streaming rather than waiting 3-5 seconds for a complete answer. Retrieval cannot stream (you need all documents before assembling context), but generation can.
+
+> **Interview tip:** The production pattern uses `astream()` after blocking retrieval. For web frontends, stream via Server-Sent Events (SSE). Mention that Nginx buffering must be disabled for SSE to work correctly.
+
+```python
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+import json
+
+app = FastAPI()
+llm = ChatOpenAI(model="gpt-4o", temperature=0, streaming=True)
+
+async def rag_stream_generator(query: str):
+    # Step 1: Retrieve (blocking — must complete before generation starts)
+    docs = await retriever.ainvoke(query)
+    context = "\n\n".join(d.page_content for d in docs)
+    
+    # Step 2: Emit retrieval metadata as first event
+    yield f"data: {json.dumps({'type': 'metadata', 'sources': [d.metadata.get('source','') for d in docs]})}\n\n"
+    
+    # Step 3: Stream generation token by token
+    prompt = ChatPromptTemplate.from_template("Context:\n{context}\n\nQuestion: {question}\n\nAnswer:")
+    async for chunk in (prompt | llm).astream({"context": context, "question": query}):
+        yield f"data: {json.dumps({'type': 'token', 'content': chunk.content})}\n\n"
+    
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+@app.get("/rag/stream")
+async def stream_rag(query: str):
+    return StreamingResponse(
+        rag_stream_generator(query),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+```
+
+---
+
+**RAG-29. How do you implement knowledge graph RAG (GraphRAG) and when is it better than vector RAG?**
+
+GraphRAG stores knowledge as a graph (entities as nodes, relationships as edges) and retrieves by traversing relationships. It excels at multi-hop reasoning and global synthesis across many documents.
+
+> **Interview tip:** Microsoft's GraphRAG paper (2024) showed it significantly outperforms vector RAG on questions requiring synthesis across many documents ("global questions"). Standard vector RAG wins on local, specific lookups. Use both in a hybrid router.
+
+```python
+from langchain_community.graphs import Neo4jGraph
+from langchain_experimental.graph_transformers import LLMGraphTransformer
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+graph_db = Neo4jGraph(url="bolt://localhost:7687", username="neo4j", password="password")
+
+transformer = LLMGraphTransformer(llm=llm)
+
+def ingest_to_graph(documents: list):
+    graph_docs = transformer.convert_to_graph_documents(documents)
+    graph_db.add_graph_documents(graph_docs, baseEntityLabel=True, include_source=True)
+
+def graph_rag_query(query: str) -> str:
+    entities_response = llm.invoke(
+        f"Extract main entities (people, companies, concepts) from: {query}\nReturn comma-separated list."
+    )
+    entities = [e.strip() for e in entities_response.content.split(",")]
+    
+    cypher = """
+    MATCH (n) WHERE n.id IN $entities OR n.name IN $entities
+    MATCH (n)-[r*1..2]-(m)
+    RETURN n.id, type(r), m.id, n.description, m.description LIMIT 50"""
+    
+    results = graph_db.query(cypher, params={"entities": entities})
+    context = "\n".join(f"{r['n.id']} --[{r['type(r)']}]--> {r['m.id']}" for r in results)
+    return llm.invoke(f"Graph relationships:\n{context}\n\nQuestion: {query}").content
+
+# When to use GraphRAG vs Vector RAG:
+# Specific fact lookup    → Vector RAG   ("What is X?")
+# Multi-hop reasoning     → GraphRAG     ("A's partner's revenue?")
+# Cross-document synthesis → GraphRAG   ("Key themes across all filings?")
+# Relationship mapping    → GraphRAG     ("How does A relate to B?")
+# Recent/exact quote      → Vector RAG   ("Quote from Section 4.2")
+```
+
+---
+
+**RAG-30. How do you do RAG over code repositories?**
+
+Code has different structure from prose — functions call other functions, and relevant context for a code question may span multiple files. Naive text chunking destroys the semantic units of code.
+
+> **Interview tip:** Production pattern: AST-based chunking at function/class boundaries, with call graph metadata for context expansion. Tree-sitter or Python's `ast` module extracts structure. Each function becomes a Document with signature, docstring, file, and call graph.
+
+```python
+import ast
+from langchain_core.documents import Document
+
+def extract_python_functions(source_code: str, file_path: str) -> list[Document]:
+    docs = []
+    tree = ast.parse(source_code)
+    
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            func_source = ast.get_source_segment(source_code, node)
+            if not func_source:
+                continue
+            
+            docstring = ast.get_docstring(node) or ""
+            calls = [
+                n.func.id for n in ast.walk(node)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            ]
+            
+            content = f"""File: {file_path}
+Name: {node.name}
+Docstring: {docstring}
+
+Code:
+{func_source}"""
+            
+            docs.append(Document(
+                page_content=content,
+                metadata={"file": file_path, "name": node.name, "calls": calls, "line": node.lineno}
+            ))
+    return docs
+
+def retrieve_with_call_graph(query: str, vectorstore, top_k: int = 3) -> list:
+    """Retrieve top-k functions, then expand with their callees for richer context."""
+    primary_docs = vectorstore.similarity_search(query, k=top_k)
+    all_names = {d.metadata["name"] for d in primary_docs}
+    expanded = list(primary_docs)
+    
+    for doc in primary_docs:
+        for callee_name in doc.metadata.get("calls", []):
+            if callee_name not in all_names:
+                callee_docs = vectorstore.similarity_search(
+                    f"function {callee_name}", k=1, filter={"name": callee_name}
+                )
+                expanded.extend(callee_docs)
+                all_names.add(callee_name)
+    return expanded
+```
+
+---
+
+**RAG-31. What is the difference between dense retrieval, sparse retrieval, and hybrid retrieval?**
+
+Dense retrieval embeds text as continuous vectors and uses ANN search. Sparse retrieval uses term frequency statistics (BM25/TF-IDF). Hybrid combines both with Reciprocal Rank Fusion.
+
+> **Interview tip:** Dense wins on semantic similarity ("affordable" matches "budget-friendly"); sparse wins on keyword precision (exact product codes, names, acronyms). Production systems almost always use hybrid. Reciprocal Rank Fusion (RRF) is the standard merge strategy.
+
+```python
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
+
+dense = vectorstore.as_retriever(search_kwargs={"k": 10})
+bm25 = BM25Retriever.from_documents(all_docs, k=10)
+
+# Hybrid with Reciprocal Rank Fusion
+# Weights tuned on golden dataset: 0.3 sparse + 0.7 dense is a common starting point
+hybrid = EnsembleRetriever(
+    retrievers=[bm25, dense],
+    weights=[0.3, 0.7]
+)
+
+# When sparse outperforms dense:
+# - Exact codes: "SKU-ABC-123", "ISIN: US0378331005" → BM25 finds exact match
+# - Named entities in specialized domains: "SOFR", "FRB-NY" → BM25 wins
+# - Short queries: BM25 is more reliable for 1-3 word queries
+
+# When dense outperforms sparse:
+# - Synonyms: "car" matches "automobile", "vehicle"
+# - Paraphrasing: "get rid of" matches "remove", "eliminate"
+# - Conceptual: "what causes inflation?" → no exact keyword match needed
+```
+
+---
+
+**RAG-32. How do you optimize RAG costs at high volume?**
+
+At scale, RAG costs come from four sources: ingestion embedding, query embedding, LLM generation (largest), and vector DB hosting. Production systems optimize each.
+
+> **Interview tip:** Most candidates only address LLM cost. Senior engineers address all four. A well-optimized RAG system can reduce costs by 60-80% vs a naive implementation without sacrificing quality.
+
+```python
+# COST 1: Ingestion embeddings — use smaller model (5x cheaper, ~95% quality)
+# text-embedding-3-small: $0.02/1M tokens vs text-embedding-3-large: $0.13/1M tokens
+
+# COST 2: Query embeddings — semantic cache (30-60% cache hit rate in production)
+# See RAG-17 for full implementation
+
+# COST 3: LLM generation — route to cheaper model when confidence is high
+async def cost_optimized_generation(query: str, context: str, confidence: float) -> str:
+    is_simple = len(query.split()) < 15 and "?" in query
+    model = "gpt-4o-mini" if (confidence > 0.90 and is_simple) else "gpt-4o"
+    # gpt-4o-mini is ~16x cheaper than gpt-4o
+    return (await ChatOpenAI(model=model, temperature=0).ainvoke(
+        f"Context: {context}\n\nQuestion: {query}"
+    )).content
+
+# COST 4: Vector DB — use PGVector for <5M vectors (free with existing Postgres)
+# vs $70-200/month for managed Pinecone at same scale
+
+# COST 5: Unnecessary retrieval — skip vector search for non-questions
+RETRIEVAL_NEEDED_PROMPT = """Does this message require searching a knowledge base?
+YES: questions or requests needing specific information
+NO: greetings, acknowledgments, simple confirmations
+Message: {message}
+Answer (YES/NO):"""
+
+async def should_retrieve(message: str, llm) -> bool:
+    result = await llm.ainvoke(RETRIEVAL_NEEDED_PROMPT.format(message=message))
+    return result.content.strip().upper() == "YES"
+# This alone saves ~20% of vector DB queries in conversational RAG
+```
+
+---
+
+**RAG-33. How do you implement RAG with real-time data sources?**
+
+Embedding-based RAG is inherently stale — the vector index reflects the state of the world at ingestion time. Real-time RAG requires a tiered architecture that combines the static knowledge base with live data.
+
+> **Interview tip:** The production pattern is a **tiered freshness architecture**: static knowledge base (updated daily/weekly) + near-real-time layer (Elasticsearch over CDC stream, sub-minute lag) + real-time API calls (live prices, balances). A freshness classifier routes each query to the right tier.
+
+```python
+from enum import Enum
+from datetime import timedelta
+
+class DataFreshness(str, Enum):
+    STATIC = "static"       # Days/weeks OK (policies, documentation)
+    RECENT = "recent"       # Hours OK (daily reports, summaries)
+    REALTIME = "realtime"   # Must be current (prices, balances, status)
+
+class TieredRAGRetriever:
+    def __init__(self, vector_store, streaming_index, live_api_tools, llm):
+        self.vector_store = vector_store
+        self.streaming_index = streaming_index  # Elasticsearch over Kafka stream
+        self.live_api_tools = live_api_tools    # Bloomberg, internal APIs
+        self.llm = llm
+
+    def classify_freshness(self, query: str) -> DataFreshness:
+        realtime_kw = ["current", "now", "today", "live", "latest price", "right now"]
+        recent_kw = ["this week", "recent", "last few days", "yesterday"]
+        q = query.lower()
+        if any(k in q for k in realtime_kw):
+            return DataFreshness.REALTIME
+        elif any(k in q for k in recent_kw):
+            return DataFreshness.RECENT
+        return DataFreshness.STATIC
+
+    async def retrieve(self, query: str) -> list:
+        freshness = self.classify_freshness(query)
+        if freshness == DataFreshness.STATIC:
+            return await self.vector_store.as_retriever().ainvoke(query)
+        elif freshness == DataFreshness.RECENT:
+            return await self.streaming_index.search(query, time_window=timedelta(hours=24))
+        else:
+            from langgraph.prebuilt import create_react_agent
+            agent = create_react_agent(self.llm, self.live_api_tools)
+            result = await agent.ainvoke({"messages": [("user", query)]})
+            from langchain_core.documents import Document
+            return [Document(
+                page_content=result["messages"][-1].content,
+                metadata={"source": "live_api", "freshness": "realtime"}
+            )]
+```
+
+---
+
+**RAG-34. How do you test a RAG system end-to-end before deploying to production?**
+
+RAG systems have three testable layers: unit tests (individual components), integration tests (full pipeline with known inputs/outputs), and evaluation tests (RAGAS quality gates on golden dataset).
+
+> **Interview tip:** Most candidates describe only integration testing. Senior engineers distinguish all three layers and know that quality gates in CI/CD block deployments when RAGAS scores drop — the same principle as code coverage thresholds.
+
+```python
+import pytest
+from unittest.mock import Mock
+from langchain_core.documents import Document
+
+# LAYER 1: UNIT TESTS
+class TestChunking:
+    def test_chunk_metadata_preserved(self):
+        doc = Document(
+            page_content="Long text...",
+            metadata={"source": "s3://bucket/file.pdf", "page": 3}
+        )
+        chunks = splitter.split_documents([doc])
+        for chunk in chunks:
+            assert chunk.metadata.get("source") == "s3://bucket/file.pdf"
+
+# LAYER 2: INTEGRATION TESTS
+class TestRAGPipeline:
+    @pytest.fixture
+    def golden_qa_pairs(self):
+        return [{
+            "question": "What is the company's revenue growth target?",
+            "expected_keywords": ["15%", "revenue"],
+            "expected_source": "strategic_plan_2024.pdf"
+        }]
+
+    def test_retrieval_returns_correct_source(self, golden_qa_pairs):
+        for qa in golden_qa_pairs:
+            docs = retriever.invoke(qa["question"])
+            sources = [d.metadata.get("source", "") for d in docs]
+            assert qa["expected_source"] in sources
+
+    def test_answer_contains_expected_content(self, golden_qa_pairs):
+        for qa in golden_qa_pairs:
+            answer = rag_chain.invoke(qa["question"])
+            for keyword in qa["expected_keywords"]:
+                assert keyword.lower() in answer.lower()
+
+# LAYER 3: QUALITY GATES IN CI/CD
+def test_ragas_quality_gates():
+    """Fail deployment if quality drops below thresholds."""
+    results = evaluate(golden_dataset, metrics=[faithfulness, answer_relevancy])
+    assert results["faithfulness"] >= 0.88, \
+        f"Faithfulness {results['faithfulness']:.3f} below threshold — deployment blocked"
+    assert results["answer_relevancy"] >= 0.82, \
+        f"Answer relevancy {results['answer_relevancy']:.3f} below threshold — deployment blocked"
+```
+
+---
+
+**RAG-35. How do you handle context window limits when documents are very long?**
+
+When retrieved chunks exceed the LLM's context limit, you must decide what to include. Naive truncation loses critical information.
+
+> **Interview tip:** Four strategies: map-reduce (production standard, parallelizable), refine (iterative, good for building up answers), recursive summarization (compression), selective inclusion (reranker picks best subset). Name each and state when to use them.
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+MAP_PROMPT = ChatPromptTemplate.from_template(
+    "Extract information relevant to: {question}\n\nText: {text}\n\nRelevant information:"
+)
+
+REDUCE_PROMPT = ChatPromptTemplate.from_template(
+    "Synthesize a comprehensive answer to: {question}\n\nExtracted information:\n{text}\n\nAnswer:"
+)
+
+async def map_reduce_rag(query: str, docs: list) -> str:
+    import asyncio
+    # MAP: process each chunk independently (parallelizable — all run concurrently)
+    map_chain = MAP_PROMPT | llm
+    map_tasks = [map_chain.ainvoke({"question": query, "text": doc.page_content}) for doc in docs]
+    mapped_results = await asyncio.gather(*map_tasks)
+    
+    relevant = [r.content for r in mapped_results if "no relevant" not in r.content.lower()]
+    
+    # REDUCE: synthesize all relevant excerpts into one answer
+    reduce_chain = REDUCE_PROMPT | llm
+    final = await reduce_chain.ainvoke({"question": query, "text": "\n\n---\n\n".join(relevant)})
+    return final.content
+
+# When to use each:
+# Map-reduce:       Q&A + summarization over many docs. Parallelizable. ← production default
+# Refine:           Answer builds progressively (timelines, step-by-step analysis)
+# Recursive:        Pure compression (500-page doc → 5-page summary)
+# Selective (top-k): Context window is generous but you want precision → rerank + top-4
+```
+
+---
+
+**RAG-36. How do you handle multilingual RAG in production?**
+
+Most embedding models are trained predominantly on English. For low-resource languages, vector similarity degrades significantly. A query in Hindi may not retrieve semantically equivalent Hindi documents.
+
+> **Interview tip:** Four strategies in priority order: multilingual embedding models (LaBSE, multilingual-e5-large), language-specific indices with routing, cross-lingual translation at query time, and machine translation at ingestion. Each has latency, cost, and quality tradeoffs.
+
+```python
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langdetect import detect
+
+# Strategy 1: Multilingual embedding model (preferred)
+multilingual_embedder = HuggingFaceEmbeddings(
+    model_name="intfloat/multilingual-e5-large",  # 100+ languages
+    encode_kwargs={"normalize_embeddings": True}
+)
+
+# Strategy 2: Language detection + per-language index routing
+def multilingual_retriever(query: str, retrievers_by_lang: dict):
+    try:
+        lang = detect(query)  # "en", "hi", "ar", "fr", etc.
+    except:
+        lang = "en"  # fallback
+    
+    if lang in retrievers_by_lang:
+        return retrievers_by_lang[lang].invoke(query)
+    return retrievers_by_lang["multilingual"].invoke(query)
+
+# Strategy 3: Cross-lingual query translation (simplest, good for low-frequency languages)
+async def translate_and_retrieve(query: str, source_lang: str) -> list:
+    if source_lang != "en":
+        english_query = (await llm.ainvoke(
+            f"Translate to English, preserving technical terminology:\n{query}"
+        )).content
+    else:
+        english_query = query
+    return await retriever.ainvoke(english_query)
+```
+
+---
+
+**RAG-37. What is the "needle in a haystack" problem in RAG and how is it solved?**
+
+A single critical piece of information buried in a large corpus — vector ANN search degrades in precision at scale and may miss the exact best match. For truly unique identifiers (contract IDs, ISINs, invoice numbers), similarity search is the wrong tool entirely.
+
+> **Interview tip:** Solutions in priority order: pre-filter by metadata (reduces search space 99%), exact-match retrieval for unique identifiers (O(1) lookup, not O(log n) ANN), and tiered search (exact first, ANN fallback).
+
+```python
+import re
+
+def smart_retriever(query: str, metadata_filter: dict, vectorstore, document_store):
+    # Stage 1: Try exact ID match — always faster and more accurate for unique identifiers
+    id_patterns = [
+        r"\b[A-Z]{2,5}-\d{3,}-\d{4}\b",  # Contract IDs: "MSFT-001-2024"
+        r"\b[A-Z]{2}\d{10}\b",             # ISIN codes: "US0378331005"
+        r"\bINV-\d{6}\b"                   # Invoice numbers
+    ]
+    for pattern in id_patterns:
+        match = re.search(pattern, query)
+        if match:
+            doc = document_store.get(match.group())  # O(1) exact lookup
+            if doc:
+                return [doc]
+    
+    # Stage 2: Pre-filter by metadata, then ANN search on reduced set
+    return vectorstore.similarity_search(
+        query=query,
+        k=6,
+        filter=metadata_filter    # Reduces from 5M to ~5K vectors before ANN
+    )
+```
+
+---
+
+**RAG-38. How do you implement self-RAG — where the model decides whether to retrieve?**
+
+Self-RAG gives the model agency over retrieval: it decides whether retrieval is needed, evaluates retrieved documents, critiques its own answer, and can regenerate if unsatisfied. Compared to always-on RAG, it reduces unnecessary API calls and improves answer quality for queries that don't need retrieval.
+
+> **Interview tip:** Implemented as a LangGraph with self-critique loops. Key production concern: setting MAX_ITERATIONS to prevent infinite loops. Name the reflection tokens concept from the original Self-RAG paper (Asai et al., 2023).
+
+```python
+from langgraph.graph import StateGraph, START, END
+from typing import TypedDict, Optional, List
+
+class SelfRAGState(TypedDict):
+    query: str
+    documents: Optional[List]
+    answer: Optional[str]
+    needs_retrieval: bool
+    answer_is_supported: bool
+    answer_is_useful: bool
+    iteration: int
+
+MAX_ITERATIONS = 3
+
+RETRIEVAL_DECISION_PROMPT = """Does answering this question require retrieving external documents?
+YES: questions needing specific facts, recent data, or domain knowledge.
+NO: general reasoning or knowledge questions.
+Return JSON: {{"needs_retrieval": true/false}}
+Question: {question}"""
+
+def decide_retrieval(state: SelfRAGState) -> SelfRAGState:
+    import json
+    result = llm.invoke(RETRIEVAL_DECISION_PROMPT.format(question=state["query"]))
+    data = json.loads(result.content)
+    return {**state, "needs_retrieval": data["needs_retrieval"]}
+
+CRITIQUE_PROMPT = """Evaluate this answer:
+1. Is it fully supported by the context? 2. Does it fully address the question?
+Context: {context}  Question: {question}  Answer: {answer}
+Return JSON: {{"supported": true/false, "useful": true/false}}"""
+
+def critique_answer(state: SelfRAGState) -> SelfRAGState:
+    import json
+    context = "\n".join(d.page_content for d in state["documents"])
+    result = llm.invoke(CRITIQUE_PROMPT.format(
+        context=context, question=state["query"], answer=state["answer"]
+    ))
+    data = json.loads(result.content)
+    return {**state, "answer_is_supported": data["supported"], "answer_is_useful": data["useful"],
+            "iteration": state["iteration"] + 1}
+
+def should_stop(state: SelfRAGState) -> str:
+    if state["iteration"] >= MAX_ITERATIONS:
+        return "end"  # Prevent infinite loops
+    if state["answer_is_supported"] and state["answer_is_useful"]:
+        return "end"
+    return "retry"
+```
+
+---
+
+**RAG-39. How do you implement document-level access control (multi-tenant RAG) at scale?**
+
+In enterprise SaaS RAG (HR chatbots, legal assistants, financial advisors), different users can access different document subsets. This is Row-Level Security at the document level.
+
+> **Interview tip:** The production rule: access control filter must be applied at the vector DB layer, never in application code. Application-layer filtering can be bypassed; DB-layer filtering cannot. Every document must be tagged at ingestion with org_id, access_level, and allowed_roles.
+
+```python
+def ingest_with_access_control(
+    documents: list,
+    org_id: str,
+    department: str,
+    classification: str,        # "public", "internal", "confidential", "restricted"
+    allowed_roles: list         # ["analyst", "manager", "executive"]
+):
+    for doc in documents:
+        doc.metadata.update({
+            "org_id": org_id,
+            "department": department,
+            "classification": classification,
+            "allowed_roles": allowed_roles,
+        })
+    vectorstore.add_documents(documents)
+
+def retrieve_authorized(query: str, user: dict) -> list:
+    # user = {"org_id": "...", "departments": [...], "roles": [...]}
+    filter_conditions = {
+        "must": [{"key": "org_id", "match": {"value": user["org_id"]}}],
+        "should": [
+            {"key": "department", "match": {"any": user["departments"]}},
+            {"key": "classification", "match": {"value": "public"}}
+        ]
+    }
+    return vectorstore.similarity_search(query=query, k=6, filter=filter_conditions)
+    # The filter is enforced by Qdrant/Pinecone at the DB layer — not bypassable
+```
+
+---
+
+**RAG-40. What is the most important difference between a demo RAG system and a production RAG system?**
+
+This is a synthesis question that tests end-to-end understanding. The answer should identify at least 5 dimensions where production RAG differs substantively from a weekend demo.
+
+> **Interview tip:** Senior engineers know that demo RAG achieves 70-80% quality easily. Getting from 80% to 95%+ requires obsessing over every component. Name the specific technical choices at each layer.
+
+```
+DIMENSION 1: CHUNKING
+  Demo:       Fixed-size splitter, chunk_size=1000
+  Production: Semantic + parent-child + structure-aware chunking
+              Impact: 15-20% improvement in Recall@5
+
+DIMENSION 2: RETRIEVAL
+  Demo:       Single vector similarity search
+  Production: Hybrid (dense + BM25) + cross-encoder reranking + metadata filters
+              Impact: 20-30% improvement in Precision@k and Recall@k
+
+DIMENSION 3: HALLUCINATION CONTROL
+  Demo:       Generic "answer from context" prompt
+  Production: Confidence gate + structured output + faithfulness judge + guardrails
+              Impact: Faithfulness from ~75% to 95%+
+
+DIMENSION 4: EVALUATION
+  Demo:       Manual spot-checking
+  Production: Golden dataset + RAGAS + CI/CD quality gates that block deployments
+              "You cannot improve what you cannot measure"
+
+DIMENSION 5: OBSERVABILITY
+  Demo:       print() statements
+  Production: Full traces (query, docs, answer, latency, scores) + dashboards + alerts
+              Essential for debugging regressions in production
+
+DIMENSION 6: SECURITY
+  Demo:       All documents accessible to all users
+  Production: DB-layer access control, PII scrubbing, prompt injection detection,
+              GDPR right-to-erasure pipeline
+
+DIMENSION 7: FRESHNESS & VERSIONING
+  Demo:       One-time ingestion, no rollback
+  Production: Event-driven incremental indexing, index versioning, blue/green deployment
+
+DIMENSION 8: COST
+  Demo:       Always GPT-4o + text-embedding-3-large + no cache
+  Production: Semantic cache + model routing + smaller embeddings
+              Result: 60-80% cost reduction without quality loss
+
+DIMENSION 9: SCALE
+  Demo:       FAISS in memory
+  Production: Qdrant/Pinecone with IVF-PQ, Ray-parallelized ingestion, horizontal scale
+
+DIMENSION 10: FAILURE HANDLING
+  Demo:       Crashes or hallucinate on bad input
+  Production: "I don't know" > hallucination, circuit breakers, graceful degradation
+```
+
+---
+
+*Last updated: June 2026 | LangChain ≥1.0 | LangGraph ≥0.4 | RAGAS ≥0.2*
